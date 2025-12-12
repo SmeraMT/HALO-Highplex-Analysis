@@ -1,0 +1,125 @@
+import pandas as pd
+import numpy as np
+import os
+from tkinter import Tk
+from tkinter.filedialog import askopenfilenames, askopenfilename
+from openpyxl import load_workbook
+import re
+
+# Upload CSV files with a GUI prompt
+def upload_files(prompt, multiple=True):
+    Tk().withdraw()
+    if multiple:
+        return askopenfilenames(title=prompt, filetypes=[("CSV Files", "*.csv")])
+    else:
+        return askopenfilename(title=prompt, filetypes=[("CSV Files", "*.csv")])
+
+# Normalize DataFrame column names
+def normalize_columns(data):
+    data.columns = data.columns.str.strip().str.lower()
+    return data
+
+# Bin distances and count entries
+def process_wsi_file(data, bin_size, cell_type_column_index):
+    bins = np.arange(0, data['distance (μm)'].max() + bin_size, bin_size)
+    data['distance bin'] = pd.cut(data['distance (μm)'], bins)
+    cell_type_column_name = data.columns[cell_type_column_index]
+    result = data.groupby(['distance bin', cell_type_column_name]).size().reset_index(name='count')
+    total_counts = result.groupby('distance bin')['count'].sum().reset_index()
+    total_counts['bins'] = total_counts['distance bin'].apply(lambda x: x.right)
+    total_counts = total_counts[['bins', 'count']]
+    modified_cell_type_name = cell_type_column_name.replace("cell id", "").strip()
+    output_column_name = f"{modified_cell_type_name} count in WSI"
+    total_counts.rename(columns={'count': output_column_name}, inplace=True)
+    return total_counts, data, modified_cell_type_name
+
+# Match with classifier labels and count tumour/stroma
+def analyze_matching_data(data1, data2, cell_type_column_name, modified_cell_type_name, bin_size):
+    data2['object id'] = data2['object id'].astype(str).str.strip()
+    data1[cell_type_column_name] = data1[cell_type_column_name].astype(str).str.strip()
+    matching_data = data1.merge(data2, left_on=cell_type_column_name, right_on="object id", how="inner")
+    matching_data['classifier label'] = matching_data['classifier label'].str.lower().str.strip()
+
+    tumour_data = matching_data[matching_data['classifier label'] == 'tumour']
+    stroma_data = matching_data[matching_data['classifier label'] == 'stroma']
+
+    def get_binned_counts(data, bins):
+        data['distance bin'] = pd.cut(data['distance (μm)'], bins)
+        binned_counts = data.groupby('distance bin').size().reset_index(name='count')
+        binned_counts['bins'] = binned_counts['distance bin'].apply(lambda x: x.right)
+        return binned_counts[['bins', 'count']]
+
+    bins = np.arange(0, data1['distance (μm)'].max() + bin_size, bin_size)
+    tumour_counts = get_binned_counts(tumour_data, bins) if not tumour_data.empty else pd.DataFrame(columns=['bins', 'count'])
+    stroma_counts = get_binned_counts(stroma_data, bins) if not stroma_data.empty else pd.DataFrame(columns=['bins', 'count'])
+
+    return tumour_counts, stroma_counts
+
+# Handle one full processing cycle and return result + sheet name
+def process_and_get_result():
+    wsi_file_paths = upload_files("Select the NN Object data CSV Files", multiple=True)
+    if not wsi_file_paths:
+        print("No WSI files selected.")
+        return None, None
+
+    match_file_path = upload_files("Select the highplex object data CSV File", multiple=False)
+    if not match_file_path:
+        print("No match file selected.")
+        return None, None
+
+    wsi_data_list = [normalize_columns(pd.read_csv(file)) for file in wsi_file_paths]
+    match_data = normalize_columns(pd.read_csv(match_file_path))
+
+    match_filename = os.path.basename(match_file_path)
+    sheet_name = os.path.splitext(match_filename)[0]
+    sheet_name = re.sub(r'[\\/*?:\[\]]', "_", sheet_name)  # Clean for Excel
+
+    cell_type_column_index = 4
+    bin_size = 0.5
+    combined_results = pd.DataFrame()
+
+    for data1 in wsi_data_list:
+        total_counts, data1, modified_cell_type_name = process_wsi_file(data1, bin_size, cell_type_column_index)
+        tumour_counts, stroma_counts = analyze_matching_data(data1, match_data, data1.columns[cell_type_column_index], modified_cell_type_name, bin_size)
+
+        final_counts = total_counts.merge(tumour_counts, on='bins', how='left', suffixes=('', '_tumour'))
+        final_counts = final_counts.merge(stroma_counts, on='bins', how='left', suffixes=('', '_stroma'))
+
+        final_counts.rename(columns={
+            'count': f'{modified_cell_type_name} count in tumour',
+            'count_stroma': f'{modified_cell_type_name} count in stroma'
+        }, inplace=True)
+
+        final_counts[f'{modified_cell_type_name} count in tumour'] = final_counts[f'{modified_cell_type_name} count in tumour'].fillna(0).astype(int)
+        final_counts[f'{modified_cell_type_name} count in stroma'] = final_counts[f'{modified_cell_type_name} count in stroma'].fillna(0).astype(int)
+
+        if combined_results.empty:
+            combined_results = final_counts
+        else:
+            combined_results = pd.concat([combined_results, pd.DataFrame(columns=['']), final_counts], axis=1)
+
+    return combined_results, sheet_name[:31]  # Excel sheet names max 31 chars
+
+# Loop for multiple runs, saving each run to new sheet
+def run_iterative_processing():
+    excel_path = "NN_TCP.xlsx"
+
+    with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a' if os.path.exists(excel_path) else 'w') as writer:
+        while True:
+            df, sheet_name = process_and_get_result()
+            if df is not None:
+                if sheet_name in writer.book.sheetnames:
+                    print(f"Warning: Sheet '{sheet_name}' already exists. Overwriting.")
+                    del writer.book[sheet_name]
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                print(f"Results written to sheet: {sheet_name}")
+
+            more = input("Do you want to process another set of files? (y/n): ").strip().lower()
+            if more != 'y':
+                break
+
+    print(f"All data saved in {excel_path}")
+
+# Run the program
+if __name__ == "__main__":
+    run_iterative_processing()
